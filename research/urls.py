@@ -8,4 +8,5 @@ urlpatterns = [
     path('research/<str:research_id>/stream', views.stream_research, name='stream_research'),
     path('models', views.get_models, name='get_models'),
     path('search-providers', views.get_search_providers, name='get_search_providers'),
+    path('upload', views.upload_image, name='upload_image'),
 ] 

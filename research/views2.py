@@ -2,43 +2,33 @@ from django.http import JsonResponse, StreamingHttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from django.conf import settings
-from django.core.files.storage import default_storage
-from django.core.files.base import ContentFile
 import json
 import asyncio
 import httpx
 import threading
-import time,re
-from httpx_aiohttp import AiohttpTransport
-from aiohttp import ClientSession
-import openai
-_loop = asyncio.new_event_loop()
-
-_thr = threading.Thread(target=_loop.run_forever, name="Async Runner",
-                        daemon=True)
-from openai import AsyncAzureOpenAI
+import time
+from openai import AsyncOpenAI
 from datetime import datetime
 from asgiref.sync import sync_to_async
 from .models import Research
 from .utils import (
-    generate_serp_queries_prompt,
+    generate_serp_queries_prompt, 
     process_search_result_prompt,
     write_final_report_prompt,
-    get_system_prompt,
+    get_system_prompt
 )
 import os
-import uuid
-from PIL import Image
 
+_loop = asyncio.new_event_loop()
+_thr = threading.Thread(target=_loop.run_forever, name="Async Runner",
+                        daemon=True)
 # --- API Endpoints ---
-
 
 @csrf_exempt
 @require_http_methods(["GET"])
 def api_root(request):
     """API health check"""
     return JsonResponse({"status": "ok", "version": "1.0.0"})
-
 
 @csrf_exempt
 @require_http_methods(["POST"])
@@ -64,8 +54,8 @@ def start_research(request):
         # Create a new research object
         research = Research(
             query=data.get("query",query),
-            model=data.get("model", "gemini-2.0-flash"),
-            search_model=data.get("model"),
+            model=data.get("model", "gemini-1.5-pro"),
+            search_model=data.get("search_model"),
             max_searches=data.get("max_searches", 5),
             custom_requirement=data.get("custom_requirement", ""),
         )
@@ -95,8 +85,6 @@ def start_research(request):
     except Exception as e:
         print(f"Error in start_research: {str(e)}")
         return JsonResponse({"error": str(e)}, status=400)
-
-
 @require_http_methods(["GET"])
 def get_research(request, research_id):
     """Get the status and results of a research process"""
@@ -107,234 +95,101 @@ def get_research(request, research_id):
         return JsonResponse({"detail": f"Research {research_id} not found"}, status=404)
 
 @require_http_methods(["GET"])
-def ret_research(request, research_id):
-    """Get the status and results of a research process"""
-    try:
-        def run_async_research():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(retry_research(research_id))
-            finally:
-                loop.close()
-
-        # Start research in a separate thread
-        thread = threading.Thread(target=run_async_research)
-        thread.daemon = True
-        thread.start()
-
-        return JsonResponse(research_id.as_dict())
-
-    except Exception:
-        return JsonResponse({"detail": f"Research {research_id} not found"}, status=404)
-
-@require_http_methods(["GET"])
 def stream_research(request, research_id):
     """Stream real-time updates of a research process"""
     try:
         research = Research.objects.get(id=research_id)
-
+        
         def event_stream():
             """Generate SSE event stream"""
             # Send initial state
             yield f"data: {json.dumps(research.as_dict())}\n\n"
-
+            
             # Track what's been sent to avoid sending duplicates
             sent_learning_count = len(research.learnings)
             sent_status = research.status
             sent_report = research.report
-
+            
             # Keep streaming updates until the research is complete
             while research.status not in ["completed", "error", "no_results"]:
                 # Refresh the research object from the database
                 research.refresh_from_db()
-
+                
                 # Send status update if it changed
                 if research.status != sent_status:
                     sent_status = research.status
                     yield f"data: {json.dumps({'status': research.status})}\n\n"
-
+                
                 # Send new learnings if any
                 current_learning_count = len(research.learnings)
                 if current_learning_count > sent_learning_count:
                     new_learnings = research.learnings[sent_learning_count:]
                     yield f"data: {json.dumps({'learnings': new_learnings})}\n\n"
                     sent_learning_count = current_learning_count
-
+                
                 # Send report if it's been generated and not sent yet
                 if research.report and research.report != sent_report:
                     sent_report = research.report
                     yield f"data: {json.dumps({'report': research.report})}\n\n"
-
+                
                 # Add a small delay to prevent overwhelming the database
                 time.sleep(1)
-
+            
             # Send final state
             yield f"data: {json.dumps({'status': 'complete', 'final': True})}\n\n"
-
-        response = StreamingHttpResponse(
-            event_stream(), content_type="text/event-stream"
-        )
-        response["Cache-Control"] = "no-cache"
-        response["X-Accel-Buffering"] = "no"  # Prevent buffering in Nginx
+        
+        response = StreamingHttpResponse(event_stream(), content_type='text/event-stream')
+        response['Cache-Control'] = 'no-cache'
+        response['X-Accel-Buffering'] = 'no'  # Prevent buffering in Nginx
         return response
-
+        
     except Research.DoesNotExist:
         return JsonResponse({"detail": f"Research {research_id} not found"}, status=404)
-
 
 @require_http_methods(["GET"])
 def get_models(request):
     """Get the list of available models"""
-    return JsonResponse(
-        {
-            "models": {
-                "gemini": ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-1.0-pro"],
-                "openai": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-                "anthropic": ["claude-3-opus", "claude-3-sonnet", "claude-3-haiku"],
-            }
+    return JsonResponse({
+        "models": {
+            "gemini": [
+                "gemini-1.5-pro",
+                "gemini-1.5-flash",
+                "gemini-1.0-pro"
+            ],
+            "openai": [
+                "gpt-4o",
+                "gpt-4-turbo",
+                "gpt-3.5-turbo"
+            ],
+            "anthropic": [
+                "claude-3-opus",
+                "claude-3-sonnet",
+                "claude-3-haiku"
+            ]
         }
-    )
-
+    })
 
 @require_http_methods(["GET"])
 def get_search_providers(request):
     """Get the list of available search providers"""
-    return JsonResponse(
-        {
-            "providers": [
-                {
-                    "id": "searxng",
-                    "name": "SearXNG",
-                    "description": "Open-source metasearch engine",
-                    "requires_key": False,
-                },
-                {
-                    "id": "tavily",
-                    "name": "Tavily",
-                    "description": "AI-powered search API",
-                    "requires_key": True,
-                },
-            ]
-        }
-    )
-
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def upload_image(request):
-    """Upload an image and return the URL"""
-    try:
-        # Check if image was uploaded
-        if 'image' not in request.FILES:
-            return JsonResponse({"error": "No image file provided"}, status=400)
-        
-        uploaded_file = request.FILES['image']
-        
-        # Validate file type
-        allowed_types = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp']
-        if uploaded_file.content_type not in allowed_types:
-            return JsonResponse({"error": "Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed."}, status=400)
-        
-        # Validate file size (limit to 10MB)
-        max_size = 10 * 1024 * 1024  # 10MB
-        if uploaded_file.size > max_size:
-            return JsonResponse({"error": "File too large. Maximum size is 10MB."}, status=400)
-        
-        # Generate a unique filename
-        file_extension = uploaded_file.name.split('.')[-1].lower()
-        unique_filename = f"{uuid.uuid4()}.{file_extension}"
-        
-        # Save the file to media directory
-        file_path = default_storage.save(
-            f"images/{unique_filename}",
-            ContentFile(uploaded_file.read())
-        )
-        
-        # Generate the URL
-        file_url = f"{request.scheme}://{request.get_host()}{settings.MEDIA_URL}{file_path}"
-        
-        return JsonResponse({
-            "url": file_url,
-            "filename": unique_filename,
-            "original_filename": uploaded_file.name,
-            "size": uploaded_file.size,
-            "content_type": uploaded_file.content_type
-        }, status=200)
-        
-    except Exception as e:
-        print(f"Error in upload_image: {str(e)}")
-        return JsonResponse({"error": f"Upload failed: {str(e)}"}, status=500)
-
+    return JsonResponse({
+        "providers": [
+            {
+                "id": "searxng",
+                "name": "SearXNG",
+                "description": "Open-source metasearch engine",
+                "requires_key": False
+            },
+            {
+                "id": "tavily",
+                "name": "Tavily",
+                "description": "AI-powered search API",
+                "requires_key": True
+            }
+        ]
+    })
 
 # --- Core Research Functions ---
-
-async def retry_research(research_id):
-    """Conduct the research process in the background"""
-    # Use sync_to_async to get the research object
-    get_research = sync_to_async(Research.objects.get)
-    research = await get_research(id=research_id)
-    cl=httpx.AsyncClient(timeout=60)
-    try:
-        # 1. Generate SERP queries
-        # Use sync_to_async for database operations
-        @sync_to_async
-        def update_research_status(status):
-            research.status = status
-            research.save()
-
-        @sync_to_async
-        def update_error(error_msg):
-            research.status = "error"
-            research.error = error_msg
-            research.save()
-            print(f"ERROR: {error_msg}")
-
-        print(f"Starting research for '{research.query}'")
-        await update_research_status("generating_queries")
-        all_learnings=json.loads(research._learnings)
-
-        await update_research_status("generating_report")
-        print("Generating final report...")
-
-        @sync_to_async
-        def get_query_and_requirement():
-            return research.query, research.custom_requirement
-
-        query, custom_requirement = await get_query_and_requirement()
-
-        report_prompt = write_final_report_prompt(
-            query, all_learnings, custom_requirement
-        )
-
-        @sync_to_async
-        def get_model():
-            return research.model
-
-        try:
-            model = await get_model()
-            print(f"Calling LLM for final report using model {model}...")
-            #import pdb;pdb.set_trace()
-            final_report, usage_metadata = await call_llm(prompt=report_prompt, model=model, temperature=0.7,mtokens=10000,client=cl)
-            print(f"Final report received: {final_report[:100]}...")
-
-            # Update the research results
-            @sync_to_async
-            def update_report():
-                research.report = final_report
-                research.status = "completed"
-                research.save()
-
-            await update_report()
-            print("Research completed successfully")
-            await cl.aclose()
-        except Exception as e:
-            print(f"Error generating final report: {str(e)}")
-            print(f"Error generating final report: {str(e)}")
-            return
-    except Exception as e:
-        print(f"Error generating final report: {str(e)}")
-        return
 
 async def conduct_research(research_id):
     """Conduct the research process in the background"""
@@ -358,37 +213,20 @@ async def conduct_research(research_id):
             print(f"ERROR: {error_msg}")
 
         print(f"Starting research for '{research.query}'")
-        print(f"Starting research for '{research.id}'")
+        print(f"Starting research for ID'{research.id}'")
 
         await update_research_status("generating_queries")
-        cl = httpx.AsyncClient(timeout=30.0)
+        cl=httpx.AsyncClient(timeout=30.0)
         try:
             print("Generating SERP queries...")
             serp_prompt = generate_serp_queries_prompt(research.query)
             print(f"Calling LLM with prompt: {serp_prompt[:100]}...")
-            serp_response = await call_llm(
-                prompt=serp_prompt,
-                model=research.model,
-                temperature=0.8,
-                mtokens=1024,
-                client=cl,
-            )
+            serp_response = await call_llm(prompt=serp_prompt,model=research.model,temperature=0.8,mtokens=1024,client=cl)
 
             print(f"LLM response received: {serp_response[:100]}...")
-            serp_response = serp_response.replace("```json", "")
-            serp_response = serp_response.replace("```", "")
-            # use regex ^Contact Name : to extract the contact name
-            contact_name = re.search(r"^Contact Name : (.*)", serp_response)
-            if contact_name:
-                contact_name = contact_name.group(1)
-            else:
-                contact_name = None
-            # use regex ^Account Name : <email> to extract the account name
-            account_name = re.search(r"^Account Name : <(.*)>", serp_response)
-            if account_name:
-                account_name = account_name.group(1)
-            else:
-                account_name = None
+            serp_response=serp_response.replace("```json","") if serp_response else ""
+            serp_response=serp_response.replace("```","") if serp_response else ""
+
             # Parse JSON response to extract queries
             try:
                 # Handle different possible JSON formats
@@ -399,17 +237,12 @@ async def conduct_research(research_id):
                     serp_queries = json.loads(json_str)
                 else:
                     serp_queries = json.loads(serp_response)
-                    serp_queries+={"query": f"{contact_name} {account_name} rocketreach profile", "researchGoal": "### 2.1. Professional Profile"}
                 print(f"Parsed {len(serp_queries)} SERP queries")
             except json.JSONDecodeError as e:
                 print(f"JSON decode error: {str(e)}, Response: {serp_response[:200]}")
                 # Fall back to a single query if JSON parsing fails
-                # import pdb;pdb.set_trace()
                 serp_queries = [
-                    {
-                        "query": research.query[:399],
-                        "researchGoal": "Research the main query",
-                    }
+                    {"query": research.query[:399], "researchGoal": "Research the main query"}
                 ]
                 print("Using fallback single query")
         except Exception as e:
@@ -428,10 +261,7 @@ async def conduct_research(research_id):
         # 2. For each query, search the web and process results
         all_learnings = []
 
-        final_report = ""
-        gemini_input_tokens = 0
-        gemini_output_tokens = 0
-
+        final_report=""
         @sync_to_async
         def get_models():
             return research.search_model or research.model
@@ -455,7 +285,7 @@ async def conduct_research(research_id):
 
                 # Search the web
                 try:
-                    search_results = await search_web(query, cl)
+                    search_results = await search_web(query,cl)
                     print(f"Found {len(search_results)} search results")
                 except Exception as e:
                     print(f"Error in web search: {str(e)}")
@@ -475,13 +305,7 @@ async def conduct_research(research_id):
                     )
 
                     try:
-                        learnings_text, usage_metadata = await call_llm(
-                            prompt=process_prompt,
-                            model=search_model,
-                            temperature=0.7,
-                            mtokens=2048,
-                            client=cl,
-                        )
+                        learnings_text = await call_llm(prompt=process_prompt, model=search_model,temperature=0.7, mtokens=2000,client=cl)
                         print(
                             f"LLM learning response received: {learnings_text[:100]}..."
                         )
@@ -494,11 +318,6 @@ async def conduct_research(research_id):
                         ]
                         print(f"Extracted {len(learnings)} learnings")
                         all_learnings.extend(learnings)
-
-                        # Aggregate tokens
-                        if usage_metadata:
-                            gemini_input_tokens += usage_metadata.get("prompt_token_count", 0)
-                            gemini_output_tokens += usage_metadata.get("candidates_token_count", 0)
 
                         # Update learnings in real-time
                         @sync_to_async
@@ -526,7 +345,6 @@ async def conduct_research(research_id):
                 return research.query, research.custom_requirement
 
             query, custom_requirement = await get_query_and_requirement()
-            # import pdb;pdb.set_trace()
             report_prompt = write_final_report_prompt(
                 query, all_learnings, custom_requirement
             )
@@ -538,12 +356,7 @@ async def conduct_research(research_id):
             try:
                 model = await get_model()
                 print(f"Calling LLM for final report using model {model}...")
-                final_report, usage_metadata = await call_llm(
-                    prompt=report_prompt, model=model, temperature=0.8, mtokens=10000
-                )
-                if usage_metadata:
-                    gemini_input_tokens += usage_metadata.get("prompt_token_count", 0)
-                    gemini_output_tokens += usage_metadata.get("candidates_token_count", 0)
+                final_report = await call_llm(prompt=report_prompt, model=model, temperature=0.8,client=cl,mtokens=10000)
                 print(f"Final report received: {final_report[:100]}...")
 
                 # Update the research results
@@ -563,10 +376,8 @@ async def conduct_research(research_id):
             print("No learnings found, marking as no_results")
             await update_research_status("no_results")
         await cl.aclose()
-        final_report = final_report.replace("```markdown", "")
-        final_report = final_report.replace("```", "")
-        print(f"[Gemini] Total input tokens for research: {gemini_input_tokens}")
-        print(f"[Gemini] Total output tokens for research: {gemini_output_tokens}")
+        final_report=final_report.replace("```markdown","")  if final_report else ""
+        final_report=final_report.replace("```","") if final_report else ""
         return final_report
     except Exception as e:
         error_msg = f"Unhandled exception: {str(e)}"
@@ -577,12 +388,10 @@ async def conduct_research(research_id):
             research.status = "error"
             research.error = error_msg
             research.save()
-
+        
         await update_error_final()
 
-
 # --- LLM Integration ---
-
 
 async def call_llm(prompt, model, temperature=0.7,mtokens=1000, client=None):
     """Call the LLM based on model type"""
@@ -599,7 +408,7 @@ async def call_llm(prompt, model, temperature=0.7,mtokens=1000, client=None):
             if not api_key:
                 raise Exception("No API key found for OpenAI model")
             print(f"Calling OpenAI API with key: {api_key[:5]}...")
-            return await generate_completion(prompt, model, api_key, temperature,mtokens)
+            return await generate_completion(prompt, model, api_key, temperature,mtokens,httpx_client=client)
 
         elif model.startswith("claude"):
             api_key = settings.ANTHROPIC_API_KEY
@@ -614,23 +423,23 @@ async def call_llm(prompt, model, temperature=0.7,mtokens=1000, client=None):
         print(f"Error in call_llm: {str(e)}")
         raise
 
-
-async def call_gemini(prompt, model, api_key, temperature, mtokens=4000, client=None):
-    """Call Gemini API with retry logic for rate limiting and return usage metadata"""
+async def call_gemini(prompt, model, api_key, temperature,mtokens,client=None):
+    """Call Gemini API with retry logic for rate limiting"""
     base_url = settings.GOOGLE_GENERATIVE_AI_API_BASE_URL
     url = f"{base_url}/{model}:generateContent"
     headers = {"Content-Type": "application/json"}
     params = {"key": api_key}
-
+    
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": temperature},
+        "generationConfig": {"temperature": temperature,"maxOutputTokens":mtokens},
     }
-
+    
+    # Retry configuration
     max_retries = 5
-    retry_delay = 2
+    retry_delay = 2  # Start with 2 seconds delay
     attempt = 0
-    print(f"Ignoring max tokens {mtokens}")
+    
     if client is not None:
         print("Using provided httpx client for Gemini API calls")
     else:
@@ -641,12 +450,17 @@ async def call_gemini(prompt, model, api_key, temperature, mtokens=4000, client=
             print(
                 f"Making request to Gemini API: {url} (attempt {attempt + 1}/{max_retries})"
             )
+            #async with client:
             response = await client.post(
-                url, headers=headers, params=params, json=payload, timeout=180.0
+                url, headers=headers, params=params, json=payload, timeout=30.0
             )
+
             if response.status_code == 429:
+                # Rate limit error - parse the response to get retry info
                 error_data = response.json()
                 print(f"Rate limit error: {error_data}")
+
+                # Calculate delay - default to exponential backoff if no specific delay given
                 retry_delay_secs = retry_delay
                 if "error" in error_data and "details" in error_data["error"]:
                     for detail in error_data["error"]["details"]:
@@ -658,28 +472,29 @@ async def call_gemini(prompt, model, api_key, temperature, mtokens=4000, client=
                                 retry_delay_secs = float(
                                     detail["retryDelay"].replace("s", "")
                                 )
+
                 print(f"Rate limited. Retrying in {retry_delay_secs} seconds...")
                 await asyncio.sleep(retry_delay_secs)
+
+                # Exponential backoff for next attempt
                 retry_delay *= 2
                 attempt += 1
                 continue
-            elif response.status_code == 503:
-                print("Service unavailable. Retrying in 10 seconds...")
-                await asyncio.sleep(10)
-                attempt += 1
-                continue
+
             if response.status_code != 200:
                 error_text = response.text
                 print(f"Gemini API error response: {error_text}")
                 raise Exception(
                     f"Gemini API error ({response.status_code}): {error_text}"
                 )
+
             result = response.json()
             if "candidates" not in result or not result["candidates"]:
                 print(f"Unexpected Gemini API response format: {result}")
                 raise Exception(
                     "Unexpected Gemini API response format: missing candidates"
                 )
+
             if (
                 "content" not in result["candidates"][0]
                 or "parts" not in result["candidates"][0]["content"]
@@ -688,12 +503,12 @@ async def call_gemini(prompt, model, api_key, temperature, mtokens=4000, client=
                     f"Unexpected Gemini API response structure: {result['candidates'][0]}"
                 )
                 raise Exception("Unexpected Gemini API response structure")
+
             if not result["candidates"][0]["content"]["parts"]:
                 print("Empty parts in Gemini API response")
                 raise Exception("Empty response from Gemini API")
-            result_text = result["candidates"][0]["content"]["parts"][0]["text"]
-            usage_metadata = result.get("usage_metadata", {})
-            return result_text, usage_metadata
+
+            return result["candidates"][0]["content"]["parts"][0]["text"]
         except httpx.RequestError as e:
             print(f"Gemini API request error: {str(e)}")
             raise Exception(f"Gemini API request error: {str(e)}")
@@ -704,6 +519,8 @@ async def call_gemini(prompt, model, api_key, temperature, mtokens=4000, client=
             if isinstance(e, asyncio.CancelledError):
                 raise
             print(f"Unexpected error in call_gemini: {str(e)}")
+
+            # Only retry on specific errors, raise others immediately
             if "rate limit" in str(e).lower() or "quota exceeded" in str(e).lower():
                 print(
                     f"Rate limit or quota error. Retrying in {retry_delay} seconds..."
@@ -713,37 +530,31 @@ async def call_gemini(prompt, model, api_key, temperature, mtokens=4000, client=
                 attempt += 1
                 continue
             raise
+
+    # If we've exhausted all retries
     raise Exception(
         f"Failed after {max_retries} attempts to call Gemini API due to rate limiting"
     )
 
-
-
-
-async def generate_completion(prompt: str, model, api_key, temperature,mtokens) -> str:
+async def generate_completion(prompt: str, model, api_key, temperature,mtokens=1000,httpx_client=None) -> str:
     try:
-#        client, transport, httpx_client = await get_azure_client(api_key)
         messages = []
         prompt = prompt[0] if isinstance(prompt, tuple) else prompt
         messages.append({"role": "system", "content": get_system_prompt()})
         messages.append({"role": "user", "content": prompt})
 
-        async with openai.DefaultAsyncHttpxClient(transport=AiohttpTransport(client=ClientSession())) as httpx_client:
-            client=AsyncAzureOpenAI(
-                azure_endpoint=AZURE_OPENAI_ENDPOINT,
-                api_key=api_key,
-                api_version=AZURE_OPENAI_API_VERSION,
-                http_client=httpx_client,
-                max_retries=3
+        client=AsyncOpenAI(
+            api_key=api_key,
+            http_client=httpx_client,
+            max_retries=3,
+        )
+        print("Generating completion...")
+        response = await client.chat.completions.create(
+            model=model,
+            max_tokens=mtokens,
+            messages=messages,
+            temperature=temperature,
             )
-            print("Generating completion...")
-            response = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                max_tokens=mtokens,
-                messages=messages,
-                temperature=temperature,
-                )
-
 
         if not response or not response.choices:
             print("Empty response from OpenAI")
@@ -755,29 +566,6 @@ async def generate_completion(prompt: str, model, api_key, temperature,mtokens) 
         print(f"Completion generation error: {str(e)}")
         return ""
 
-async def call_openai(prompt, model, api_key, temperature):
-    """Call OpenAI API"""
-    base_url = settings.OPENAI_API_BASE_URL
-    url = f"{base_url}/chat/completions?api_version=2024-08-01-preview"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": get_system_prompt()},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": temperature,
-    }
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=payload)
-        if response.status_code != 200:
-            raise Exception(f"OpenAI API error: {response.text}")
-
-        result = response.json()
-        return result["choices"][0]["message"]["content"]
-
 
 async def call_anthropic(prompt, model, api_key, temperature):
     """Call Anthropic API"""
@@ -786,26 +574,26 @@ async def call_anthropic(prompt, model, api_key, temperature):
     headers = {
         "Content-Type": "application/json",
         "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
+        "anthropic-version": "2023-06-01"
     }
-
+    
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": temperature
     }
-
+    
     async with httpx.AsyncClient() as client:
         response = await client.post(url, headers=headers, json=payload)
         if response.status_code != 200:
             raise Exception(f"Anthropic API error: {response.text}")
-
+        
         result = response.json()
         return result["content"][0]["text"]
 
-
 # --- Web Search Integration ---
-
 
 async def search_web(query,client=None):
     """Search the web using available search API"""
@@ -825,92 +613,78 @@ async def search_web(query,client=None):
         print(f"Error in search_web: {str(e)}")
         raise
 
-
 async def search_with_searxng(query):
     """Search the web using SearXNG with fallback instances"""
     # List of SearXNG instances to try in order
     instances = [
-        os.getenv("SEARXNG_API_BASE_URL", "https://searx.be/search"),
+        os.getenv('SEARXNG_API_BASE_URL', 'https://searx.be/search'),
         "https://searx.tiekoetter.com/search",
         "https://search.mdosch.de/search",
-        "https://search.privacyguides.net/search",
+        "https://search.privacyguides.net/search"
     ]
-
+    
     # Custom user agent to avoid being blocked
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
-
+    
     # Parameters for the search
     params = {"q": query, "format": "json", "engines": "google"}
-
+    
     # Try each instance until one works
     for instance_url in instances:
         print(f"Trying SearXNG instance: {instance_url}")
-
+        
         try:
             async with httpx.AsyncClient() as client:
                 print(f"Making request to SearXNG: {instance_url}?q={query}")
-                response = await client.get(
-                    instance_url, params=params, headers=headers, timeout=30.0
-                )
-
+                response = await client.get(instance_url, params=params, headers=headers, timeout=30.0)
+                
                 if response.status_code == 403:
                     print(f"403 Forbidden from {instance_url}, trying next instance...")
                     continue
-
+                
                 if response.status_code != 200:
                     error_text = response.text
-                    print(
-                        f"SearXNG API error response from {instance_url}: {error_text}"
-                    )
+                    print(f"SearXNG API error response from {instance_url}: {error_text}")
                     continue
-
+                
                 try:
                     results = response.json()
                 except json.JSONDecodeError as e:
-                    print(
-                        f"SearXNG API JSON decode error from {instance_url}: {str(e)}, Response: {response.text[:200]}"
-                    )
+                    print(f"SearXNG API JSON decode error from {instance_url}: {str(e)}, Response: {response.text[:200]}")
                     continue
-
+                
                 # Format the results into a list of dictionaries
                 sources = []
                 if "results" not in results or not results.get("results"):
                     print(f"No results from {instance_url}")
                     continue
-
-                for result in results.get("results", [])[
-                    :5
-                ]:  # Limit to first 5 results
+                    
+                for result in results.get("results", [])[:5]:  # Limit to first 5 results
                     if "content" in result and "url" in result:
-                        sources.append(
-                            {"url": result["url"], "content": result["content"]}
-                        )
-
+                        sources.append({"url": result["url"], "content": result["content"]})
+                
                 if sources:
-                    print(
-                        f"SearXNG instance {instance_url} returned {len(sources)} results"
-                    )
+                    print(f"SearXNG instance {instance_url} returned {len(sources)} results")
                     return sources
                 else:
                     print(f"No valid results from {instance_url}")
         except httpx.RequestError as e:
             print(f"SearXNG API request error from {instance_url}: {str(e)}")
-
+    
     # If all instances failed, fall back to mock results
     print("All SearXNG instances failed, using fallback mock results")
     return [
         {
             "url": "https://example.com/result1",
-            "content": f"This is a mock search result for query: {query}. The search providers are currently unavailable.",
+            "content": f"This is a mock search result for query: {query}. The search providers are currently unavailable."
         },
         {
             "url": "https://example.com/result2",
-            "content": "Please consider using Tavily search provider instead by setting SEARCH_PROVIDER=tavily in your .env file and adding a valid Tavily API key.",
-        },
+            "content": "Please consider using Tavily search provider instead by setting SEARCH_PROVIDER=tavily in your .env file and adding a valid Tavily API key."
+        }
     ]
-
 
 async def search_with_tavily(query,client=None):
     """Search the web using Tavily"""
@@ -933,28 +707,15 @@ async def search_with_tavily(query,client=None):
         "exclude_domains": [],
     }
 
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            #async with client:
-            response = await client.post(tavily_url, headers=headers, json=payload)
-            if response.status_code != 200:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(20)
-                    continue
-                else:
-                    raise Exception(f"Tavily API error: {response.text}")
+    #async with client:
+    response = await client.post(tavily_url, headers=headers, json=payload)
+    if response.status_code != 200:
+        raise Exception(f"Tavily API error: {response.text}")
 
-            results = response.json()
-            sources = []
-            for result in results.get("results", [])[:5]:
-                if "content" in result and "url" in result:
-                    sources.append({"url": result["url"], "content": result["content"]})
+    results = response.json()
+    sources = []
+    for result in results.get("results", [])[:5]:
+        if "content" in result and "url" in result:
+            sources.append({"url": result["url"], "content": result["content"]})
 
-            return sources
-        except Exception as e:
-            if attempt < max_retries - 1:
-                await asyncio.sleep(20)
-                continue
-            else:
-                raise e
+    return sources
